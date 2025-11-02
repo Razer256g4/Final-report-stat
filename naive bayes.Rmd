@@ -1,0 +1,262 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+library(dplyr)
+library(caret)
+library(nnet)   # multinom
+library(purrr)
+library(tidyr)
+library(pROC)
+```
+
+```{r}
+# 1) Data & Target Mapping 
+df = read.csv("/Users/razer256g4/USYD/Semester 3/stat 5003/Data Cleaned and Imputed.csv")
+```
+
+```{r}
+names(df)
+```
+
+```{r}
+# Target column name in your data:
+target_name = "X.Ever.told..you.had.diabetes"
+```
+
+```{r}
+# Validate that the column exists (works even if it contains spaces/parentheses)
+if (!target_name %in% names(df)) {
+  stop(paste0("Target column not found: ", target_name,
+              "\nAvailable names containing 'diabetes': ",
+              paste(grep("diabetes", names(df), value = TRUE, ignore.case = TRUE), collapse = " | ")))
+}
+```
+
+```{r}
+# Your code mapping: 3=No diabetes, 4=Prediabetes, 1=Diabetes, 2=Gestational/Other
+df <- df %>%
+  mutate(
+    DiabetesClass = factor(
+      dplyr::pull(., target_name),
+      levels = c(3, 4, 1, 2),   # 按逻辑顺序排列（No → Prediabetes → Diabetes → Gestational）
+      labels = c("No diabetes", "Prediabetes", "Diabetes", "Gestational/Other")
+    )
+  )
+```
+
+```{r}
+# 2) Feature selection 
+candidate_numeric <- c(
+  "Imputed.Age.value.collapsed.above.80",
+  "Computed.body.mass.index",
+  "Reported.Weight.in.Pounds",
+  "Days.in.past.30.had.alcoholic.beverage_daily_avg",
+  "height_in",
+  "Number.of.Days.Physical.Health.Not.Good",
+  "Number.of.Days.Mental.Health.Not.Good",
+  "Poor.Physical.or.Mental.Health"
+)
+
+candidate_categorical <- c(
+  "Calculated.sex.variable",
+  "Exercise.in.Past.30.Days",
+  "Computed.Smoking.Status",
+  "Education.Level",
+  "Income.Level",
+  "Have.any.health.insurance",
+  "Have.Personal.Health.Care.Provider.",
+  "Could.Not.Afford.To.See.Doctor",
+  "Length.of.time.since.last.routine.checkup"
+)
+```
+
+```{r}
+# Check the existing columns
+candidate_numeric     <- intersect(candidate_numeric, names(df))
+candidate_categorical <- intersect(candidate_categorical, names(df))
+feature_cols <- c(candidate_numeric, candidate_categorical)
+
+df_model <- df %>%
+  select(DiabetesClass, all_of(feature_cols)) %>%
+  drop_na()
+```
+
+```{r}
+# 3) Training/testing segmentation
+set.seed(5003)
+idx <- createDataPartition(df_model$DiabetesClass, p = 0.8, list = FALSE)
+train <- df_model[idx, ]
+test  <- df_model[-idx, ]
+```
+
+```{r}
+# 4) Dummy variable + standardization
+dmy <- dummyVars(~ ., data = train %>% select(-DiabetesClass), fullRank = TRUE)
+x_train_raw <- predict(dmy, newdata = train)
+x_test_raw  <- predict(dmy, newdata = test)
+
+pp <- preProcess(x_train_raw, method = c("center", "scale"))
+x_train <- predict(pp, x_train_raw)
+x_test  <- predict(pp,  x_test_raw)
+
+y_train <- train$DiabetesClass
+y_test  <- test$DiabetesClass
+```
+
+2.Gaussian Naive Bayes
+
+```{r}
+# 1) Feature selection is the same as logistic regression
+
+df_nb <- df %>%
+  dplyr::select(DiabetesClass, dplyr::all_of(feature_cols)) %>%
+  # Naive Bayes cannot contain NA. Here, the missing parts are deleted. If samples need to be retained, interpolation can be used instead
+  tidyr::drop_na() %>%
+  # Convert the character columns uniformly to factor (e1071::naiveBayes requires factor/ values)
+  dplyr::mutate(dplyr::across(where(is.character), factor))
+```
+
+
+```{r}
+# 2) Training/Test splitting (Reuse previous 80/20)
+if (!exists("train") || !exists("test") ||
+    !"DiabetesClass" %in% names(train) || !"DiabetesClass" %in% names(test)) {
+  set.seed(5003)
+  idx <- caret::createDataPartition(df_nb$DiabetesClass, p = 0.8, list = FALSE)
+  train <- df_nb[idx, ]
+  test  <- df_nb[-idx, ]
+} else {
+  # If there is already a train/test, only the column to be used currently will be retained and the same conversion will be performed
+  train <- train %>% dplyr::select(DiabetesClass, dplyr::all_of(feature_cols)) %>%
+    tidyr::drop_na() %>% dplyr::mutate(dplyr::across(where(is.character), factor))
+  test  <- test  %>% dplyr::select(DiabetesClass, dplyr::all_of(feature_cols)) %>%
+    tidyr::drop_na() %>% dplyr::mutate(dplyr::across(where(is.character), factor))
+}
+```
+
+```{r}
+# 3) Align the factor levels of training/testing (to prevent errors at new levels)
+align_factor <- function(tr, te) {
+  for (nm in names(tr)) {
+    if (is.factor(tr[[nm]])) {
+      lv <- union(levels(tr[[nm]]), levels(te[[nm]]))
+      tr[[nm]] <- factor(tr[[nm]], levels = lv)
+      te[[nm]] <- factor(te[[nm]], levels = lv)
+    }
+  }
+  list(train = tr, test = te)
+}
+aligned <- align_factor(train, test)
+train <- aligned$train; test <- aligned$test
+```
+
+```{r}
+# === 4) Train three Naive Bayes models (klaR, baseline / equal / inverse prior) ===
+library(klaR)
+
+# 训练集真实分布（按 levels 顺序对齐，避免先验名称错位）
+y_tr  <- droplevels(train$DiabetesClass)
+lev   <- levels(y_tr)
+freq  <- table(y_tr)
+freq  <- freq[lev]  # 关键：按 levels 排序！
+
+# 均等先验 & 逆频率先验（名称与 levels 完全一致）
+prior_equal <- setNames(rep(1/length(lev), length(lev)), lev)
+prior_inv   <- setNames((1/as.numeric(freq)) / sum(1/as.numeric(freq)), lev)
+
+set.seed(5003)
+nb_base <- klaR::NaiveBayes(DiabetesClass ~ ., data = train, usekernel = TRUE)                     # baseline: 数据先验
+nb_eq   <- klaR::NaiveBayes(DiabetesClass ~ ., data = train, prior = prior_equal, usekernel = TRUE)
+nb_inv  <- klaR::NaiveBayes(DiabetesClass ~ ., data = train, prior = prior_inv,   usekernel = TRUE)
+
+# 验证三者先验确实不同
+cat("\napriori (baseline):\n"); print(nb_base$apriori)
+cat("\napriori (equal):\n");    print(nb_eq$apriori)
+cat("\napriori (inverse):\n");  print(nb_inv$apriori)
+```
+
+```{r}
+# === 评估函数（适配 klaR：predict() 返回 list，含 $class 和 $posterior） ===
+library(pROC)
+
+eval_nb_klar <- function(model, te, name = "NB (klaR)") {
+  pr   <- predict(model, newdata = te)
+  pred <- pr$class
+  prob <- as.matrix(pr$posterior)   # 概率矩阵
+  y    <- te$DiabetesClass
+
+  cm  <- caret::confusionMatrix(pred, y)
+  acc <- unname(cm$overall["Accuracy"])
+
+  # 每类 F1 & 宏平均 F1
+  f1_per_class <- sapply(levels(y), function(lbl){
+    tp <- sum(pred == lbl & y == lbl)
+    fp <- sum(pred == lbl & y != lbl)
+    fn <- sum(pred != lbl & y == lbl)
+    prec <- ifelse(tp+fp==0, 0, tp/(tp+fp))
+    rec  <- ifelse(tp+fn==0, 0, tp/(tp+fn))
+    ifelse(prec+rec==0, 0, 2*prec*rec/(prec+rec))
+  })
+  macro_f1 <- mean(f1_per_class)
+
+  # Macro/Micro AUC（one-vs-rest）
+  y_mat <- model.matrix(~ y - 1)
+  colnames(y_mat) <- gsub("^y", "", colnames(y_mat))
+  common_levels <- intersect(colnames(y_mat), colnames(prob))
+  y_mat <- y_mat[, common_levels, drop = FALSE]
+  p_mat <- prob[,  common_levels, drop = FALSE]
+
+  auc_per_class <- sapply(seq_along(common_levels), function(i) {
+    pROC::roc(response = y_mat[, i], predictor = p_mat[, i], quiet = TRUE)$auc
+  })
+  macro_auc <- mean(auc_per_class)
+  micro_auc <- {
+    vec_y <- as.vector(y_mat); vec_p <- as.vector(p_mat)
+    as.numeric(pROC::roc(response = vec_y, predictor = vec_p, quiet = TRUE)$auc)
+  }
+
+  list(
+    metrics = tibble::tibble(Model = name, Accuracy = acc,
+                             Macro_F1 = macro_f1, Macro_AUC = macro_auc, Micro_AUC = micro_auc),
+    cm = cm$table
+  )
+}
+```
+
+```{r}
+# === 5) Compare three models (klaR) ===
+res_base <- eval_nb_klar(nb_base, test, name = "NB (baseline, klaR)")
+res_eq   <- eval_nb_klar(nb_eq,   test, name = "NB (equal prior, klaR)")
+res_inv  <- eval_nb_klar(nb_inv,  test, name = "NB (inverse prior, klaR)")
+
+perf_nb <- dplyr::bind_rows(res_base$metrics, res_eq$metrics, res_inv$metrics)
+
+cat("\n=== Gaussian Naive Bayes (klaR): Prior Comparison ===\n")
+print(perf_nb)
+
+# === HTML Table (for R Markdown output) ===
+knitr::kable(
+  perf_nb,
+  format = "html",
+  caption = "Table 1. Performance Comparison of Gaussian Naive Bayes Models with Different Priors",
+  digits = 4
+)
+
+cat("\nConfusion Matrix (Baseline):\n"); print(res_base$cm)
+cat("\nConfusion Matrix (Equal prior):\n"); print(res_eq$cm)
+cat("\nConfusion Matrix (Inverse prior):\n"); print(res_inv$cm)
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+

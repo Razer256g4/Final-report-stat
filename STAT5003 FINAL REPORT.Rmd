@@ -12,7 +12,7 @@ output:
 <style>
 details > summary {
   cursor: pointer;
-  color: #1aa260;        /* 绿色标题 */
+  color: #1aa260;
   font-weight: 600;
   margin: .25rem 0;
 }
@@ -580,31 +580,6 @@ Interpretation
 
 
 
-## Model comparison — test set
-
-```{r}
-# Consolidated test-set metrics across best variants per model
-metrics_list <- list()
-if (exists("res_w"))        metrics_list[["Multinom (Weighted)"]]                  <- res_w$metrics
-if (exists("res_nb_bal"))   metrics_list[["Gaussian NB (Balanced prior)"]]         <- res_nb_bal$metrics
-if (exists("res_knn"))      metrics_list[["kNN (best k)"]]                          <- res_knn$metrics
-if (exists("res_rp"))       metrics_list[["Decision Tree (best cp/depth)"]]        <- res_rp$metrics
-if (exists("res_xgb"))      metrics_list[["XGBoost (best depth)"]]                 <- res_xgb$metrics
-
-comp_tbl <- dplyr::bind_rows(metrics_list, .id = "ModelLabel") |>
-  dplyr::select(ModelLabel, dplyr::everything()) |>
-  dplyr::arrange(dplyr::desc(Macro_F1), dplyr::desc(Accuracy))
-
-DT::datatable(comp_tbl,
-              caption = "Model comparison — Test-set metrics (sorted by Macro-F1)",
-              options = list(pageLength = 10, autoWidth = TRUE, scrollX = TRUE, class = 'cell-border stripe'))
-```
-
-Interpretation
-
-- Macro-F1 is the primary metric for class-imbalance robustness; prefer the top-ranked model by Macro-F1.
-- If two models tie on Macro-F1, consider Accuracy and Macro-AUC as secondary criteria.
-
 
 ## Model 3: k-Nearest Neighbors (kNN)
 
@@ -925,6 +900,31 @@ Notes
 </details>
 
 
+
+## Model comparison — test set
+
+```{r}
+# Consolidated test-set metrics across best variants per model
+metrics_list <- list()
+if (exists("res_w"))        metrics_list[["Multinom (Weighted)"]]                  <- res_w$metrics
+if (exists("res_nb_bal"))   metrics_list[["Gaussian NB (Balanced prior)"]]         <- res_nb_bal$metrics
+if (exists("res_knn"))      metrics_list[["kNN (best k)"]]                          <- res_knn$metrics
+if (exists("res_rp"))       metrics_list[["Decision Tree (best cp/depth)"]]        <- res_rp$metrics
+if (exists("res_xgb"))      metrics_list[["XGBoost (best depth)"]]                 <- res_xgb$metrics
+
+comp_tbl <- dplyr::bind_rows(metrics_list, .id = "ModelLabel") |>
+  dplyr::select(ModelLabel, dplyr::everything()) |>
+  dplyr::arrange(dplyr::desc(Macro_F1), dplyr::desc(Accuracy))
+
+DT::datatable(comp_tbl,
+              caption = "Model comparison — Test-set metrics (sorted by Macro-F1)",
+              options = list(pageLength = 10, autoWidth = TRUE, scrollX = TRUE, class = 'cell-border stripe'))
+```
+
+Interpretation
+
+- Macro-F1 is the primary metric for class-imbalance robustness; prefer the top-ranked model by Macro-F1.
+- If two models tie on Macro-F1, consider Accuracy and Macro-AUC as secondary criteria.
 
 
 

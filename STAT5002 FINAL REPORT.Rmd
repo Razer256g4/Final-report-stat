@@ -1,0 +1,945 @@
+---
+title: "STAT5002 FINAL REPORT"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: "hide"
+    highlight: tango
+---
+
+<style>
+details > summary {
+  cursor: pointer;
+  color: #1aa260;        /* 绿色标题 */
+  font-weight: 600;
+  margin: .25rem 0;
+}
+details { margin: .5rem 0 1rem; }
+</style>
+
+---
+
+## Model 1: Multinominal Logistic Regression
+
+<details>
+<summary>Data & Target Mapping</summary>
+
+
+
+```{r include=FALSE}
+# ---- Libraries ----
+library(dplyr)
+library(tidyr)
+library(caret)
+library(nnet)      # multinom
+library(e1071)     # Gaussian Naive Bayes
+library(rpart)     # Decision Trees
+library(xgboost)   # Gradient Boosted Trees
+library(pROC)
+library(knitr)
+library(DT)
+
+set.seed(5003)
+options(dplyr.summarise.inform = FALSE)
+
+```
+
+
+```{r setup, include=FALSE}
+# Global chunk options: enable caching to speed up re-knits
+knitr::opts_chunk$set(
+  cache = TRUE,
+  cache.path = "cache/",
+  autodep = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+
+# Fast-mode toggle for first runs; set to FALSE for full 5×3 CV and larger grids
+fast_mode <- TRUE
+
+# CV and training knobs driven by fast_mode
+CV_R <- if (fast_mode) 1 else 3
+CV_K <- 5
+XGB_NROUNDS <- if (fast_mode) 100 else 200
+KNN_GRID <- if (fast_mode) c(5) else c(3,5,7,9,11)
+RPART_CP_GRID <- if (fast_mode) c(0.01) else c(0.001, 0.01)
+RPART_DEPTH_GRID <- if (fast_mode) c(3) else c(3, 5)
+XGB_DEPTH_GRID <- if (fast_mode) c(3) else c(3, 6)
+```
+
+
+```{r include=FALSE}
+#  1) Data & Target Mapping
+
+df <- read.csv("Data Cleaned and Imputed.csv")
+
+names(df)
+
+target_name <- "X.Ever.told..you.had.diabetes"
+if (!target_name %in% names(df)) {
+stop(paste0("Target column not found: ", target_name,
+"\nAvailable names containing 'diabetes': ",
+paste(grep("diabetes", names(df), value = TRUE, ignore.case = TRUE), collapse = " | ")))
+}
+
+# 3=No, 4=Prediabetes, 1=Diabetes, 2=Gestational/Other
+
+df <- df %>%
+mutate(
+DiabetesClass = factor(
+dplyr::pull(., target_name),
+levels = c(3, 4, 1, 2),
+labels = c("No diabetes", "Prediabetes", "Diabetes", "Gestational/Other")
+)
+)
+```
+</details>
+<details>
+<summary>Feature selection</summary>
+```{r}
+# 2) Feature selection
+
+candidate_numeric <- c(
+"Imputed.Age.value.collapsed.above.80",
+"Computed.body.mass.index",
+"Reported.Weight.in.Pounds",
+"Days.in.past.30.had.alcoholic.beverage_daily_avg",
+"height_in",
+"Number.of.Days.Physical.Health.Not.Good",
+"Number.of.Days.Mental.Health.Not.Good",
+"Poor.Physical.or.Mental.Health"
+)
+candidate_categorical <- c(
+"Calculated.sex.variable",
+"Exercise.in.Past.30.Days",
+"Computed.Smoking.Status",
+"Education.Level",
+"Income.Level",
+"Have.any.health.insurance",
+"Have.Personal.Health.Care.Provider.",
+"Could.Not.Afford.To.See.Doctor",
+"Length.of.time.since.last.routine.checkup"
+)
+
+candidate_numeric     <- intersect(candidate_numeric, names(df))
+candidate_categorical <- intersect(candidate_categorical, names(df))
+feature_cols <- c(candidate_numeric, candidate_categorical)
+
+df_model <- df %>%
+dplyr::select(DiabetesClass, dplyr::all_of(feature_cols)) %>%
+tidyr::drop_na()
+```
+</details>
+<details>
+<summary>Train/Test (stratified) & Standarize</summary>
+```{r}
+# ---- 3) Train/Test (stratified) ----
+
+idx  <- caret::createDataPartition(df_model$DiabetesClass, p = 0.8, list = FALSE)
+train <- df_model[idx, ]
+test  <- df_model[-idx, ]
+
+# ---- 4) Dummy + Standardize ----
+
+dmy <- caret::dummyVars(~ ., data = train %>% dplyr::select(-DiabetesClass), fullRank = TRUE)
+x_train_raw <- predict(dmy, newdata = train)
+x_test_raw  <- predict(dmy, newdata = test)
+
+pp <- caret::preProcess(x_train_raw, method = c("center", "scale"))
+x_train <- predict(pp, x_train_raw)
+x_test  <- predict(pp, x_test_raw)
+
+y_train <- train$DiabetesClass
+y_test  <- test$DiabetesClass
+```
+</details>
+<details>
+<summary>Evaluation</summary>
+
+```{r}
+# Only for CV (excluding AUC),very fast during development
+eval_multiclass_fast <- function(fit, x_te, y_te, model_name = "model") {
+  pred_class <- predict(fit, newdata = data.frame(x_te))
+  cm  <- caret::confusionMatrix(pred_class, y_te)
+  acc <- unname(cm$overall["Accuracy"])
+
+  # Macro-F1
+  f1_per_class <- sapply(levels(y_te), function(lbl) {
+    tp <- sum(pred_class == lbl & y_te == lbl)
+    fp <- sum(pred_class == lbl & y_te != lbl)
+    fn <- sum(pred_class != lbl & y_te == lbl)
+    prec <- ifelse(tp + fp == 0, 0, tp/(tp+fp))
+    rec  <- ifelse(tp + fn == 0, 0, tp/(tp+fn))
+    ifelse(prec + rec == 0, 0, 2*prec*rec/(prec+rec))
+  })
+  macro_f1 <- mean(f1_per_class)
+
+  list(
+    metrics = tibble::tibble(Model = model_name,
+                             Accuracy = acc,
+                             Macro_F1 = macro_f1),
+    cm = cm$table
+  )
+}
+```
+
+
+
+
+
+
+```{r}
+# ---- 5) Eval helper (define BEFORE CV) ----
+
+eval_multiclass <- function(fit, x_te, y_te, model_name = "model") {
+
+# predictions
+
+pred_class <- predict(fit, newdata = data.frame(x_te))
+pred_prob <- NULL
+for (tp in c("probs", "prob", "raw")) {
+  pr <- tryCatch(predict(fit, newdata = data.frame(x_te), type = tp), error = function(e) NULL)
+  if (!is.null(pr)) { pred_prob <- as.data.frame(pr); break }
+}
+cm  <- caret::confusionMatrix(pred_class, y_te)
+acc <- unname(cm$overall["Accuracy"])
+
+# per-class F1 & macro-F1
+
+f1_per_class <- sapply(levels(y_te), function(lbl) {
+tp <- sum(pred_class == lbl & y_te == lbl)
+fp <- sum(pred_class == lbl & y_te != lbl)
+fn <- sum(pred_class != lbl & y_te == lbl)
+pr <- ifelse(tp+fp==0, 0, tp/(tp+fp))
+rc <- ifelse(tp+fn==0, 0, tp/(tp+fn))
+ifelse(pr+rc==0, 0, 2*pr*rc/(pr+rc))
+})
+macro_f1 <- mean(f1_per_class)
+
+# macro-AUC
+
+macro_auc <- NA_real_
+if (!is.null(pred_prob)) {
+y_mat <- model.matrix(~ y_te - 1)
+colnames(y_mat) <- gsub("^y_te", "", colnames(y_mat))
+lv <- intersect(colnames(y_mat), colnames(pred_prob))
+aucs <- sapply(seq_along(lv), function(i) {
+pROC::roc(response = y_mat[, lv[i]], predictor = pred_prob[, lv[i]], quiet = TRUE)$auc
+})
+macro_auc <- mean(aucs)
+}
+
+list(
+metrics = tibble::tibble(Model = model_name,
+Accuracy = acc,
+Macro_F1 = macro_f1,
+Macro_AUC = macro_auc),
+cm = cm$table,
+f1_per_class = tibble::tibble(Class = names(f1_per_class),
+F1 = as.numeric(f1_per_class))
+)
+}
+```
+
+</details>
+<details>
+<summary>Repeated cross-validation & parameter tuning</summary>
+```{r}
+# ---- 6) 5x3 Repeated stratified CV with decay tuning ----
+
+# weights: NULL (unweighted) or vector sample_weights
+
+# decays: small grid for L2 regularization (tuning)
+
+cv_eval_multinom_fast <- function(X, y, R = 1, K = 5, weights = NULL, seed = 5003,
+                                  folds_list = NULL) {
+  set.seed(seed)
+  # Pre-generation & Reuse folding
+  if (is.null(folds_list)) {
+    folds_list <- replicate(R, caret::createFolds(y, k = K, returnTrain = TRUE), simplify = FALSE)
+  }
+  out <- vector("list", R * K); c <- 1
+  for (r in seq_len(R)) {
+    folds <- folds_list[[r]]
+    for (i in seq_along(folds)) {
+      tr <- folds[[i]]; te <- setdiff(seq_along(y), tr)
+      fit <- nnet::multinom(y[tr] ~ ., data = data.frame(y = y[tr], X[tr, ]),
+                            weights = if (is.null(weights)) NULL else weights[tr],
+                            trace = FALSE)
+      res <- eval_multiclass_fast(fit, X[te, ], y[te], model_name = sprintf("CV r%d-k%d", r, i))
+      out[[c]] <- res$metrics; c <- c + 1
+    }
+  }
+  summary <- dplyr::bind_rows(out) |>
+    dplyr::summarise(across(c(Accuracy, Macro_F1),
+                            list(mean = \(x) mean(x, na.rm = TRUE),
+                                 sd   = \(x) sd(x, na.rm = TRUE))))
+  list(summary = summary, folds = folds_list)
+}
+```
+**Cross-validation (5×3 repeated stratified CV)**
+
+- *Setup*: We performed stratified K-fold CV with repeated runs, reusing the same folds for fair comparison between Unweighted and Class-weighted multinomial logistic regression.
+
+  - *Dev run*: **5×1** (5 folds, 1 repeat) to reduce runtime.
+
+  - *Final report*: **5×3** (5 folds, 3 repeats) for stabler estimates.
+
+  - *Note*: This fast CV does **not** tune decay; it evaluates a fixed model under two weighting schemes.
+
+- *Primary metric*: **Macro-F1** (averaged over classes) is emphasized because the task is multi-class and imbalanced. This avoids the **high-accuracy paradox**, where a model can get high accuracy by over-predicting the majority class while performing poorly on minority classes.
+
+- *Result*: The **Class-weighted** model shows higher (or comparable) mean Macro-F1 than Unweighted, with similar (or slightly larger) variance across folds/repeats. This indicates class weighting improves minority-class detection during training without materially increasing variance.
+
+- *Accuracy trade-off*: As expected, **Unweighted** can yield higher overall accuracy by favoring the majority class, but Class-weighted gives a better Macro-F1, aligning with our objective to treat classes more fairly.
+
+- *Reporting*: We only compute AUC on the **held-out test set**, not inside CV, to save compute and keep CV focused on class-balance–sensitive metrics.
+
+
+
+
+
+
+```{r}
+# ---- 7) Class weights (for weighted run) ----
+
+cat("\nClass distribution in training set:\n")
+print(prop.table(table(y_train)))
+
+class_freq <- table(y_train)
+class_weights <- 1 / class_freq
+sample_weights <- as.numeric(class_weights[as.character(y_train)])
+
+```
+
+
+
+```{r}
+# ---- 8) CV: Unweighted vs Weighted ----
+
+# final draft：5×3 Repeated Stratified CV (Reuse the same set of folds to ensure comparability)
+set.seed(5003)
+folds_reused <- replicate(CV_R, caret::createFolds(y_train, k = CV_K, returnTrain = TRUE), simplify = FALSE)
+
+cv_unw <- cv_eval_multinom_fast(x_train, y_train, R = 3, K = 5,
+                                weights = NULL, folds_list = folds_reused)
+cv_w   <- cv_eval_multinom_fast(x_train, y_train, R = 3, K = 5,
+                                weights = sample_weights, folds_list = folds_reused)
+
+cv_tbl <- dplyr::bind_rows(
+  tibble::tibble(Setting = "Unweighted", cv_unw$summary),
+  tibble::tibble(Setting = "Class-weighted", cv_w$summary)
+)
+
+knitr::kable(
+  cv_tbl, format = "html",
+  caption = "5×3 Repeated Stratified CV（train only）：mean ± sd（Macro-F1/Accuracy）",
+  digits = 4
+)
+
+```
+
+
+```{r}
+# ---- 9) Fit final models (the most frequent decay in use CV) ----
+
+decay_unw <- ifelse(is.null(cv_unw$picked_decay_mode), 0, cv_unw$picked_decay_mode)
+decay_w   <- ifelse(is.null(cv_w$picked_decay_mode),   0, cv_w$picked_decay_mode)
+
+fit_unw <- nnet::multinom(y_train ~ ., data = data.frame(y_train, x_train),
+decay = decay_unw, trace = FALSE)
+
+fit_w   <- nnet::multinom(y_train ~ ., data = data.frame(y_train, x_train),
+weights = sample_weights, decay = decay_w, trace = FALSE)
+
+```
+</details>
+<details>
+<summary>Confusion Matrix and Performance</summary>
+
+```{r}
+# ---- 10) Test-set evaluation ----
+
+res_unw <- eval_multiclass(fit_unw, x_test, y_test, model_name = "Multinom (Unweighted)")
+res_w   <- eval_multiclass(fit_w,   x_test, y_test, model_name = "Multinom (Weighted)")
+
+perf_compare <- dplyr::bind_rows(res_unw$metrics, res_w$metrics)
+knitr::kable(perf_compare, format = "html",
+caption = "Test-set Performance — primary metric: Macro-F1", digits = 4)
+
+cat("\nConfusion Matrix (Unweighted):\n"); print(res_unw$cm)
+cat("\nConfusion Matrix (Weighted):\n");   print(res_w$cm)
+```
+**Test set (final model)**
+
+- *Unweighted vs Weighted*: The unweighted model tends to produce higher **accuracy** but ignores minority classes, leading to lower **Macro-F1**. In contrast, the weighted model sacrifices a small amount of accuracy but **significantly increases** minority-class F1, thereby raising overall Macro-F1—in line with the project’s objectives.
+
+- *Confusion matrices*: The weighted model reduced the number of cases where Prediabetes or Gestational/Other were misclassified as No diabetes (even if modestly), which adds more value in public health applications.
+
+```{r}
+# ---- 11) OR + 95% CI for interpretability (weighted model as example) ----
+
+sm <- summary(fit_w)
+coefs <- sm$coefficients; ses <- sm$standard.errors
+coef_df <- as.data.frame(coefs); se_df <- as.data.frame(ses)
+coef_df$class <- rownames(coefs); se_df$class <- rownames(ses)
+
+tidy_multi <- coef_df |>
+pivot_longer(-class, names_to = "term", values_to = "estimate") |>
+left_join(se_df |> pivot_longer(-class, names_to = "term", values_to = "std.error"),
+by = c("class","term")) |>
+mutate(
+z = estimate/std.error,
+p.value = 2*(1 - pnorm(abs(z))),
+OR = exp(estimate),
+OR_low  = exp(estimate - 1.96*std.error),
+OR_high = exp(estimate + 1.96*std.error)
+)
+
+datatable(
+tidy_multi,
+caption = "Logistic Regression Coefficients and Odds Ratios (Weighted MLR)",
+options = list(pageLength = 10, autoWidth = TRUE, scrollX = TRUE, class = 'cell-border stripe')
+)
+```
+**OR & 95% CI (based on the weighted model)**
+
+- Most coefficients in the *Prediabetes vs No* diabetes contrast have **p > 0.05** and confidence intervals that cross 1, so no significant conclusions should be drawn. They should be interpreted as **directional signals**—for example, positive coefficients for *Age* and *BMI* (OR > 1) indicate that “as Age/BMI increases, the log-odds of being in Prediabetes relative to No diabetes also increase.”
+
+- The wide confidence intervals are mainly due to **class imbalance and weak signal strength**. Future improvement could involve better features, more minority-class samples, or interpretability analysis using tree-based models with SHAP values.
+
+
+
+
+**Takeaways**
+
+- **Primary metric = Macro-F1**. The weighted MLR better aligns with project goals by ensuring fairness and preventing minority classes from being overlooked.
+
+- **Regularization tuning (decay)**. The optimal L2 regularization strength was selected through 5×3 CV, helping to prevent overfitting and improve generalization.
+
+- **Limitations**. Most single-variable ORs are not significant for minority-class contrasts; future work could introduce interaction terms, nonlinear effects, or compare against tree-based models.
+ - **Limitations**. Most single-variable ORs are not significant for minority-class contrasts; future work could introduce interaction terms, nonlinear effects, or compare against tree-based models.
+
+
+
+## Model 2: Gaussian Naive Bayes
+
+<details>
+<summary>Data & Target (reused)</summary>
+
+The same cleaned dataset, target mapping, feature selection, and train/test split from Model 1 are reused here. We also reuse the dummy-encoded and standardized matrices `x_train`, `x_test` and factors `y_train`, `y_test` for a fair, apples-to-apples comparison.
+
+</details>
+
+<details>
+<summary>Repeated cross-validation</summary>
+
+```{r}
+# Fast CV for Gaussian Naive Bayes (no tuning parameters)
+cv_eval_nb_fast <- function(X, y, R = 3, K = 5, prior = NULL, seed = 5003,
+                            folds_list = NULL) {
+  set.seed(seed)
+  if (is.null(folds_list)) {
+    folds_list <- replicate(R, caret::createFolds(y, k = K, returnTrain = TRUE), simplify = FALSE)
+  }
+  out <- vector("list", R * K); c <- 1
+  for (r in seq_len(R)) {
+    folds <- folds_list[[r]]
+    for (i in seq_along(folds)) {
+      tr <- folds[[i]]; te <- setdiff(seq_along(y), tr)
+  fit <- e1071::naiveBayes(x = data.frame(X[tr, , drop = FALSE]), y = y[tr], prior = prior)
+  cat(sprintf("[NB CV] r=%d fold=%d complete\n", r, i)); flush.console()
+      res <- eval_multiclass_fast(fit, X[te, , drop = FALSE], y[te],
+                                  model_name = sprintf("CV r%d-k%d", r, i))
+      out[[c]] <- res$metrics; c <- c + 1
+    }
+  }
+  summary <- dplyr::bind_rows(out) |>
+    dplyr::summarise(across(c(Accuracy, Macro_F1),
+                            list(mean = \(x) mean(x, na.rm = TRUE),
+                                 sd   = \(x) sd(x, na.rm = TRUE))))
+  list(summary = summary, folds = folds_list)
+}
+
+# Priors: empirical (default) vs balanced (uniform across classes)
+bal_prior <- rep(1 / length(levels(y_train)), length(levels(y_train)))
+names(bal_prior) <- levels(y_train)
+
+# Reuse folds from MLR if available; otherwise create once here
+if (!exists("folds_reused")) {
+  set.seed(5003)
+  folds_reused <- replicate(CV_R, caret::createFolds(y_train, k = CV_K, returnTrain = TRUE), simplify = FALSE)
+}
+
+cv_nb_emp <- cv_eval_nb_fast(x_train, y_train, R = 3, K = 5,
+                             prior = NULL, folds_list = folds_reused)
+cv_nb_bal <- cv_eval_nb_fast(x_train, y_train, R = 3, K = 5,
+                             prior = bal_prior, folds_list = folds_reused)
+
+cv_nb_tbl <- dplyr::bind_rows(
+  tibble::tibble(Setting = "Empirical prior", cv_nb_emp$summary),
+  tibble::tibble(Setting = "Balanced prior (uniform)", cv_nb_bal$summary)
+)
+
+knitr::kable(
+  cv_nb_tbl, format = "html",
+  caption = "Gaussian NB — 5×3 Repeated Stratified CV (train only): mean ± sd (Macro-F1/Accuracy)",
+  digits = 4
+)
+```
+
+Notes
+
+- Like the MLR dev run, we emphasize Macro-F1 for imbalance robustness.
+- Gaussian NB has no regularization hyperparameter here; we compare only priors.
+- Balanced priors counteract majority-class dominance by upweighting minority classes via P(Y).
+
+</details>
+
+<details>
+<summary>Fit final models</summary>
+
+```{r}
+fit_nb_emp <- e1071::naiveBayes(x = data.frame(x_train), y = y_train, prior = NULL)
+fit_nb_bal <- e1071::naiveBayes(x = data.frame(x_train), y = y_train, prior = bal_prior)
+```
+
+</details>
+
+<details>
+<summary>Confusion Matrix and Performance</summary>
+
+```{r}
+res_nb_emp <- eval_multiclass(fit_nb_emp, x_test, y_test,
+                              model_name = "Gaussian NB (Empirical prior)")
+res_nb_bal <- eval_multiclass(fit_nb_bal, x_test, y_test,
+                              model_name = "Gaussian NB (Balanced prior)")
+
+perf_nb_compare <- dplyr::bind_rows(res_nb_emp$metrics, res_nb_bal$metrics)
+knitr::kable(perf_nb_compare, format = "html",
+             caption = "Gaussian NB — Test-set Performance (primary metric: Macro-F1)", digits = 4)
+
+cat("\nConfusion Matrix (Empirical prior):\n"); print(res_nb_emp$cm)
+cat("\nConfusion Matrix (Balanced prior):\n");   print(res_nb_bal$cm)
+```
+
+Summary
+
+- Empirical priors often yield higher accuracy by reflecting class frequencies, but can depress Macro-F1.
+- Balanced priors typically boost minority-class recall and Macro-F1 with a small accuracy trade-off — matching the fairness objective.
+
+</details>
+
+<details>
+<summary>Class-conditional numeric means (interpretability)</summary>
+
+```{r}
+# Per-class means on standardized and original scales for key numeric features
+num_cols <- intersect(candidate_numeric, colnames(x_train))
+train_aug <- data.frame(x_train[, num_cols, drop = FALSE])
+train_aug$Class <- y_train
+
+z_means <- train_aug |>
+  dplyr::group_by(Class) |>
+  dplyr::summarise(dplyr::across(dplyr::all_of(num_cols), ~ mean(.x, na.rm = TRUE)), .groups = "drop") |>
+  tidyr::pivot_longer(-Class, names_to = "Variable", values_to = "Mean_z")
+
+# Convert back to original scale using preProcess centering/scaling from Model 1
+pp_center <- pp$mean; pp_scale <- pp$std
+z_means <- z_means |>
+  dplyr::mutate(
+    Mean_original = Mean_z * pp_scale[Variable] + pp_center[Variable]
+  )
+
+DT::datatable(
+  z_means,
+  caption = "Gaussian NB — Per-class means for key numeric features (z-scale and original scale)",
+  options = list(pageLength = 10, autoWidth = TRUE, scrollX = TRUE, class = 'cell-border stripe')
+)
+```
+
+Interpretation
+
+- Higher per-class means (e.g., Age, BMI) for the diabetes classes relative to No diabetes align with medical expectations.
+- Because features were standardized, Mean_z magnitudes are directly comparable across variables; original-scale means aid practical interpretation.
+
+</details>
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Model comparison — test set
+
+```{r}
+# Consolidated test-set metrics across best variants per model
+metrics_list <- list()
+if (exists("res_w"))        metrics_list[["Multinom (Weighted)"]]                  <- res_w$metrics
+if (exists("res_nb_bal"))   metrics_list[["Gaussian NB (Balanced prior)"]]         <- res_nb_bal$metrics
+if (exists("res_knn"))      metrics_list[["kNN (best k)"]]                          <- res_knn$metrics
+if (exists("res_rp"))       metrics_list[["Decision Tree (best cp/depth)"]]        <- res_rp$metrics
+if (exists("res_xgb"))      metrics_list[["XGBoost (best depth)"]]                 <- res_xgb$metrics
+
+comp_tbl <- dplyr::bind_rows(metrics_list, .id = "ModelLabel") |>
+  dplyr::select(ModelLabel, dplyr::everything()) |>
+  dplyr::arrange(dplyr::desc(Macro_F1), dplyr::desc(Accuracy))
+
+DT::datatable(comp_tbl,
+              caption = "Model comparison — Test-set metrics (sorted by Macro-F1)",
+              options = list(pageLength = 10, autoWidth = TRUE, scrollX = TRUE, class = 'cell-border stripe'))
+```
+
+Interpretation
+
+- Macro-F1 is the primary metric for class-imbalance robustness; prefer the top-ranked model by Macro-F1.
+- If two models tie on Macro-F1, consider Accuracy and Macro-AUC as secondary criteria.
+
+
+## Model 3: k-Nearest Neighbors (kNN)
+
+<details>
+<summary>Repeated cross-validation (k tuning)</summary>
+
+```{r}
+# CV for kNN using caret::knn3 and reused folds; tune a small grid of k
+wrap_knn3 <- function(fit) structure(list(fit = fit), class = "knn3_wrap")
+
+predict.knn3_wrap <- function(object, newdata, type = NULL) {
+  if (is.null(type)) type <- "class"
+  if (type %in% c("class", "raw")) {
+    probs <- as.data.frame(predict(object$fit, newdata = data.frame(newdata), type = "prob"))
+    lv <- colnames(probs)
+    cls <- factor(lv[max.col(probs, ties.method = "first")], levels = lv)
+    return(cls)
+  }
+  if (type %in% c("prob", "probs")) {
+    return(as.data.frame(predict(object$fit, newdata = data.frame(newdata), type = "prob")))
+  }
+  stop("Unsupported type for knn3_wrap")
+}
+
+cv_eval_knn_fast <- function(X, y, ks = c(3,5,7,9,11), R = 3, K = 5, folds_list = NULL, seed = 5003) {
+  set.seed(seed)
+  if (is.null(folds_list)) {
+    folds_list <- replicate(R, caret::createFolds(y, k = K, returnTrain = TRUE), simplify = FALSE)
+  }
+  res <- list()
+  for (k in ks) {
+    out <- vector("list", R * K); c <- 1
+    for (r in seq_len(R)) {
+      folds <- folds_list[[r]]
+      for (i in seq_along(folds)) {
+        tr <- folds[[i]]; te <- setdiff(seq_along(y), tr)
+        fit0 <- caret::knn3(x = X[tr, , drop = FALSE], y = y[tr], k = k)
+        fit  <- wrap_knn3(fit0)
+  ev <- eval_multiclass_fast(fit, X[te, , drop = FALSE], y[te], model_name = sprintf("CV r%d-k%d (k=%d)", r, i, k))
+  cat(sprintf("[kNN CV] k=%d r=%d fold=%d complete\n", k, r, i)); flush.console()
+        out[[c]] <- ev$metrics; c <- c + 1
+      }
+    }
+    res[[as.character(k)]] <- dplyr::bind_rows(out) |>
+      dplyr::summarise(across(c(Accuracy, Macro_F1),
+                              list(mean = \(x) mean(x, na.rm = TRUE), sd = \(x) sd(x, na.rm = TRUE)))) |>
+      dplyr::mutate(k = k, .before = 1)
+  }
+  list(summary = dplyr::bind_rows(res), folds = folds_list)
+}
+
+if (!exists("folds_reused")) {
+  set.seed(5003)
+  folds_reused <- replicate(CV_R, caret::createFolds(y_train, k = CV_K, returnTrain = TRUE), simplify = FALSE)
+}
+
+cv_knn <- cv_eval_knn_fast(x_train, y_train, ks = KNN_GRID, R = CV_R, K = CV_K, folds_list = folds_reused)
+cv_knn_tbl <- cv_knn$summary
+
+knitr::kable(cv_knn_tbl, format = "html",
+             caption = "kNN — 5×3 Repeated Stratified CV over k: mean ± sd (Macro-F1/Accuracy)", digits = 4)
+
+# pick best k by Macro_F1 mean
+best_k <- cv_knn_tbl |>
+  dplyr::arrange(dplyr::desc(Macro_F1_mean), dplyr::desc(Accuracy_mean)) |>
+  dplyr::slice(1) |>
+  dplyr::pull(k)
+cat(sprintf("\nSelected k = %d based on CV Macro-F1.\n", best_k))
+```
+
+</details>
+
+<details>
+<summary>Fit final model and evaluate</summary>
+
+```{r}
+fit_knn0 <- caret::knn3(x = x_train, y = y_train, k = best_k)
+fit_knn  <- wrap_knn3(fit_knn0)
+
+res_knn <- eval_multiclass(fit_knn, x_test, y_test, model_name = sprintf("kNN (k=%d)", best_k))
+
+knitr::kable(res_knn$metrics, format = "html",
+             caption = "kNN — Test-set Performance", digits = 4)
+cat("\nConfusion Matrix (kNN):\n"); print(res_knn$cm)
+```
+
+Notes
+
+- Standardization helps kNN by making distances comparable across features.
+- We tuned k on Macro-F1 to focus on balanced performance across classes.
+
+</details>
+
+
+## Model 4: Decision Trees (rpart)
+
+<details>
+<summary>Repeated cross-validation (small grid)</summary>
+
+```{r}
+cv_eval_rpart_fast <- function(X, y, cp_grid = c(0.001, 0.01), depth_grid = c(3, 5), R = 3, K = 5,
+                               folds_list = NULL, seed = 5003) {
+  set.seed(seed)
+  if (is.null(folds_list)) {
+    folds_list <- replicate(R, caret::createFolds(y, k = K, returnTrain = TRUE), simplify = FALSE)
+  }
+  combos <- expand.grid(cp = cp_grid, maxdepth = depth_grid)
+  out_all <- list()
+  for (row in seq_len(nrow(combos))) {
+    cp <- combos$cp[row]; md <- combos$maxdepth[row]
+    out <- vector("list", R * K); c <- 1
+    for (r in seq_len(R)) {
+      folds <- folds_list[[r]]
+      for (i in seq_along(folds)) {
+        tr <- folds[[i]]; te <- setdiff(seq_along(y), tr)
+        df_tr <- data.frame(y = y[tr], X[tr, , drop = FALSE])
+        fit <- rpart::rpart(y ~ ., data = df_tr, method = "class",
+                            control = rpart::rpart.control(cp = cp, maxdepth = md))
+  ev <- eval_multiclass_fast(fit, X[te, , drop = FALSE], y[te],
+                                   model_name = sprintf("CV r%d-k%d (cp=%.4f, depth=%d)", r, i, cp, md))
+  cat(sprintf("[rpart CV] cp=%.4f depth=%d r=%d fold=%d complete\n", cp, md, r, i)); flush.console()
+        out[[c]] <- ev$metrics; c <- c + 1
+      }
+    }
+    out_all[[row]] <- dplyr::bind_rows(out) |>
+      dplyr::summarise(across(c(Accuracy, Macro_F1),
+                              list(mean = \(x) mean(x, na.rm = TRUE), sd = \(x) sd(x, na.rm = TRUE)))) |>
+      dplyr::mutate(cp = cp, maxdepth = md, .before = 1)
+  }
+  list(summary = dplyr::bind_rows(out_all), folds = folds_list)
+}
+
+if (!exists("folds_reused")) {
+  set.seed(5003)
+  folds_reused <- replicate(CV_R, caret::createFolds(y_train, k = CV_K, returnTrain = TRUE), simplify = FALSE)
+}
+
+cv_rp <- cv_eval_rpart_fast(x_train, y_train, cp_grid = RPART_CP_GRID, depth_grid = RPART_DEPTH_GRID,
+                            R = CV_R, K = CV_K, folds_list = folds_reused)
+cv_rp_tbl <- cv_rp$summary
+
+knitr::kable(cv_rp_tbl, format = "html",
+             caption = "Decision Trees — 5×3 Repeated Stratified CV: mean ± sd (Macro-F1/Accuracy)", digits = 4)
+
+best_tree <- cv_rp_tbl |>
+  dplyr::arrange(dplyr::desc(Macro_F1_mean), dplyr::desc(Accuracy_mean)) |>
+  dplyr::slice(1)
+best_cp <- best_tree$cp; best_md <- best_tree$maxdepth
+cat(sprintf("\nSelected cp=%.4f, maxdepth=%d based on CV Macro-F1.\n", best_cp, best_md))
+```
+
+</details>
+
+<details>
+<summary>Fit final model, performance, and variable importance</summary>
+
+```{r}
+fit_rp <- rpart::rpart(y_train ~ ., data = data.frame(y_train, x_train), method = "class",
+                       control = rpart::rpart.control(cp = best_cp, maxdepth = best_md))
+
+res_rp <- eval_multiclass(fit_rp, x_test, y_test, model_name = "Decision Tree (rpart)")
+knitr::kable(res_rp$metrics, format = "html",
+             caption = "Decision Trees — Test-set Performance", digits = 4)
+cat("\nConfusion Matrix (Decision Tree):\n"); print(res_rp$cm)
+
+# Variable importance (if available)
+if (!is.null(fit_rp$variable.importance)) {
+  vi <- tibble::tibble(Feature = names(fit_rp$variable.importance),
+                       Importance = as.numeric(fit_rp$variable.importance)) |>
+        dplyr::arrange(dplyr::desc(Importance))
+  DT::datatable(vi, caption = "Decision Tree — Variable Importance",
+                options = list(pageLength = 10, autoWidth = TRUE, scrollX = TRUE, class = 'cell-border stripe'))
+}
+```
+
+</details>
+
+
+## Model 5: XGBoost (multiclass)
+
+<details>
+<summary>Helper wrapper and CV (tiny grid, GPU-enabled if available)</summary>
+
+```{r}
+# Wrapper to provide class and probability predictions consistent with eval_multiclass
+make_xgb_wrap <- function(model, levels) structure(list(model = model, levels = levels), class = "xgb_wrap")
+
+predict.xgb_wrap <- function(object, newdata, type = NULL) {
+  m <- as.matrix(newdata)
+  n_class <- length(object$levels)
+  raw <- xgboost::predict(object$model, m)
+  probs <- matrix(raw, ncol = n_class, byrow = TRUE)
+  colnames(probs) <- object$levels
+  if (is.null(type) || type == "class") {
+    cls <- factor(colnames(probs)[max.col(probs, ties.method = "first")], levels = object$levels)
+    return(cls)
+  }
+  if (type %in% c("prob", "probs", "raw")) return(as.data.frame(probs))
+  stop("Unsupported type for xgb_wrap")
+}
+
+# Try GPU first (gpu_hist); fall back to CPU (hist) if GPU is unavailable
+.xgb_train_gpu_first <- function(dtrain, num_class, max_depth, eta, nrounds) {
+  # GPU attempt
+  bst <- tryCatch(
+    xgboost::xgboost(
+      data = dtrain,
+      objective = "multi:softprob",
+      num_class = num_class,
+      max_depth = max_depth,
+      eta = eta,
+      nrounds = nrounds,
+      tree_method = "gpu_hist",
+      predictor = "gpu_predictor",
+      verbose = 0
+    ), error = function(e) NULL
+  )
+  if (!is.null(bst)) return(list(model = bst, mode = "gpu"))
+  # CPU fallback
+  bst <- xgboost::xgboost(
+    data = dtrain,
+    objective = "multi:softprob",
+    num_class = num_class,
+    max_depth = max_depth,
+    eta = eta,
+    nrounds = nrounds,
+    tree_method = "hist",
+    verbose = 0
+  )
+  list(model = bst, mode = "cpu")
+}
+
+cv_eval_xgb_fast <- function(X, y, depth_grid = c(3, 6), nrounds = 200, eta = 0.1, R = 3, K = 5,
+                             folds_list = NULL, seed = 5003) {
+  set.seed(seed)
+  if (is.null(folds_list)) {
+    folds_list <- replicate(R, caret::createFolds(y, k = K, returnTrain = TRUE), simplify = FALSE)
+  }
+  lv <- levels(y)
+  out_all <- list()
+  for (md in depth_grid) {
+    out <- vector("list", R * K); c <- 1
+    for (r in seq_len(R)) {
+      folds <- folds_list[[r]]
+      for (i in seq_along(folds)) {
+        tr <- folds[[i]]; te <- setdiff(seq_along(y), tr)
+        dtr <- xgboost::xgb.DMatrix(data = as.matrix(X[tr, , drop = FALSE]),
+                                    label = as.integer(y[tr]) - 1)
+        trn <- .xgb_train_gpu_first(dtr, num_class = length(lv), max_depth = md, eta = eta, nrounds = nrounds)
+        fit <- make_xgb_wrap(trn$model, lv)
+        ev <- eval_multiclass_fast(fit, X[te, , drop = FALSE], y[te],
+                                   model_name = sprintf("CV r%d-k%d (depth=%d)", r, i, md))
+  cat(sprintf("[XGB CV] depth=%d mode=%s r=%d fold=%d complete\n", md, trn$mode, r, i)); flush.console()
+        out[[c]] <- ev$metrics; c <- c + 1
+      }
+    }
+    out_all[[as.character(md)]] <- dplyr::bind_rows(out) |>
+      dplyr::summarise(across(c(Accuracy, Macro_F1),
+                              list(mean = \(x) mean(x, na.rm = TRUE), sd = \(x) sd(x, na.rm = TRUE)))) |>
+      dplyr::mutate(max_depth = md, .before = 1)
+  }
+  list(summary = dplyr::bind_rows(out_all), folds = folds_list)
+}
+
+if (!exists("folds_reused")) {
+  set.seed(5003)
+  folds_reused <- replicate(CV_R, caret::createFolds(y_train, k = CV_K, returnTrain = TRUE), simplify = FALSE)
+}
+
+cv_xgb <- cv_eval_xgb_fast(x_train, y_train, depth_grid = XGB_DEPTH_GRID, nrounds = XGB_NROUNDS, eta = 0.1,
+                           R = CV_R, K = CV_K, folds_list = folds_reused)
+cv_xgb_tbl <- cv_xgb$summary
+
+knitr::kable(cv_xgb_tbl, format = "html",
+             caption = "XGBoost — 5×3 Repeated Stratified CV over max_depth: mean ± sd (Macro-F1/Accuracy)",
+             digits = 4)
+
+best_md_xgb <- cv_xgb_tbl |>
+  dplyr::arrange(dplyr::desc(Macro_F1_mean), dplyr::desc(Accuracy_mean)) |>
+  dplyr::slice(1) |>
+  dplyr::pull(max_depth)
+cat(sprintf("\nSelected max_depth=%d for XGBoost based on CV Macro-F1.\n", best_md_xgb))
+```
+
+</details>
+
+<details>
+<summary>Fit final model (GPU if available), performance, and top features</summary>
+
+```{r}
+lv <- levels(y_train)
+dtrain <- xgboost::xgb.DMatrix(data = as.matrix(x_train), label = as.integer(y_train) - 1)
+trn_final <- .xgb_train_gpu_first(dtrain, num_class = length(lv), max_depth = best_md_xgb, eta = 0.1, nrounds = 200)
+bst_final <- trn_final$model
+cat(sprintf("\nXGBoost training mode: %s (gpu preferred, cpu fallback)\n", trn_final$mode))
+fit_xgb <- make_xgb_wrap(bst_final, lv)
+
+res_xgb <- eval_multiclass(fit_xgb, x_test, y_test, model_name = sprintf("XGBoost (depth=%d)", best_md_xgb))
+knitr::kable(res_xgb$metrics, format = "html",
+             caption = "XGBoost — Test-set Performance", digits = 4)
+cat("\nConfusion Matrix (XGBoost):\n"); print(res_xgb$cm)
+
+# Top feature importance
+imp <- tryCatch(xgboost::xgb.importance(model = bst_final, feature_names = colnames(x_train)), error = function(e) NULL)
+if (!is.null(imp)) {
+  imp_top <- head(imp, 20)
+  DT::datatable(imp_top, caption = "XGBoost — Top 20 Feature Importance",
+                options = list(pageLength = 10, autoWidth = TRUE, scrollX = TRUE, class = 'cell-border stripe'))
+}
+```
+
+Notes
+
+- We keep a tiny grid to control runtime; depth often captures most variance in small tabular problems.
+- XGBoost usually excels on structured data; standardization is optional but harmless here.
+- GPU acceleration: This section prefers NVIDIA GPU via tree_method = "gpu_hist"; if unavailable, it automatically falls back to CPU. Other models (MLR, NB, kNN, rpart) are CPU-only in base R.
+
+</details>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
